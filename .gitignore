@@ -1,0 +1,38 @@
+# Credentials and local relay state
+.env
+.env.*
+!.env.example
+.envrc
+*.dpapi
+*.pem
+*.key
+host-id.txt
+keys.json
+usage.json
+auth.json
+credentials.json
+*.fingerprint
+
+# Local runtime files and generated data
+*.log
+*.pid
+*.tmp
+logs/
+/data/
+/runtime/
+/work/
+/outputs/
+
+# Dependencies, test output and local editor files
+node_modules/
+.npm/
+.cache/
+coverage/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Legacy launcher kept on existing installations
+/启动聊天.cmd

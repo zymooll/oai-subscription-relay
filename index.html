@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Responses 中继管理台</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script type="module" src="/dashboard.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="shell top-inner">
+      <div class="brand">
+        <div class="mark" aria-hidden="true"><i></i><i></i><i></i></div>
+        <h1>Responses 中继</h1>
+      </div>
+      <div class="top-actions">
+        <span class="pill" id="service-status">正在连接</span>
+        <button class="button subtle" id="shutdown" type="button" disabled>关闭服务</button>
+      </div>
+    </div>
+  </header>
+  <main class="shell dashboard">
+    <div class="notice" id="notice" role="status" hidden></div>
+    <div class="connection-grid">
+      <section class="panel" aria-labelledby="authorization-title">
+        <div class="panel-head">
+          <h2 id="authorization-title">ChatGPT 授权</h2>
+          <span class="pill" id="account-state">未连接</span>
+        </div>
+        <dl class="settings">
+          <div><dt>当前账号</dt><dd id="account-email">—</dd></div>
+          <div><dt>访问令牌有效至</dt><dd id="account-expiry">—</dd></div>
+        </dl>
+        <div class="actions">
+          <button class="button primary" id="login" type="button" disabled>使用 ChatGPT 登录</button>
+          <button class="button" id="switch-account" type="button" hidden>切换账号</button>
+          <button class="button subtle" id="logout" type="button" hidden>退出授权</button>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="connection-title">
+        <div class="panel-head"><h2 id="connection-title">客户端连接</h2></div>
+        <dl class="settings credentials">
+          <div>
+            <dt>Base URL</dt>
+            <dd><code id="base-url">—</code><button class="button compact" id="copy-url" type="button">复制地址</button></dd>
+          </div>
+          <div><dt>协议</dt><dd>OpenAI Responses</dd></div>
+        </dl>
+      </section>
+    </div>
+    <section class="panel" aria-labelledby="keys-title">
+      <div class="panel-head">
+        <div>
+          <h2 id="keys-title">中继 API Keys</h2>
+          <p class="description" id="key-count" role="status">正在读取密钥…</p>
+        </div>
+        <div class="actions">
+          <button class="button" id="refresh-keys" type="button" disabled>刷新用量</button>
+          <button class="button primary" id="new-key" type="button" disabled>创建密钥</button>
+        </div>
+      </div>
+      <div class="table-wrap" id="key-table" hidden>
+        <table class="key-table">
+          <thead><tr><th scope="col">密钥</th><th scope="col">模型与到期</th><th scope="col">用量 / 上限</th><th scope="col">操作</th></tr></thead>
+          <tbody id="key-rows"></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="panel" aria-labelledby="usage-title">
+      <div class="panel-head">
+        <div>
+          <h2 id="usage-title">中继用量</h2>
+          <p class="description">本机中继记录的调用，按本机日期汇总。</p>
+        </div>
+        <div class="actions">
+          <select id="usage-period" aria-label="用量时间范围" disabled>
+            <option value="1">今日</option>
+            <option value="7" selected>最近 7 天</option>
+            <option value="30">最近 30 天</option>
+          </select>
+          <button class="button" id="refresh-usage" type="button" disabled>刷新</button>
+          <a class="button" href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer">查看 ChatGPT 套餐用量 ↗</a>
+        </div>
+      </div>
+      <dl class="metrics">
+        <div><dt>已记录请求</dt><dd id="usage-requests">—</dd></div>
+        <div><dt>输入 tokens</dt><dd id="usage-input">—</dd></div>
+        <div><dt>输出 tokens</dt><dd id="usage-output">—</dd></div>
+        <div><dt>合计 tokens</dt><dd id="usage-total">—</dd></div>
+      </dl>
+      <p class="detail" id="usage-detail" role="status">连接 ChatGPT 后查看本机用量。</p>
+      <details id="usage-days" hidden>
+        <summary>按日明细</summary>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">日期</th><th scope="col">请求</th><th scope="col">输入 tokens</th><th scope="col">输出 tokens</th><th scope="col">合计 tokens</th></tr></thead>
+            <tbody id="usage-rows"></tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+    <section class="panel" aria-labelledby="models-title">
+      <div class="panel-head">
+        <div>
+          <h2 id="models-title">可用模型</h2>
+          <p class="description" id="model-cache" role="status">连接 ChatGPT 后查询模型列表。</p>
+          <p class="description">价格为每百万 tokens 的 USD 参考价，来自 <a href="https://models.dev" target="_blank" rel="noreferrer">models.dev</a>。<span id="price-status" role="status"></span></p>
+        </div>
+        <div class="actions">
+          <input id="model-filter" type="search" aria-label="筛选模型" placeholder="筛选模型" disabled>
+          <button class="button" id="refresh-models" type="button" disabled>刷新模型</button>
+          <button class="button" id="refresh-prices" type="button" disabled>刷新价格</button>
+        </div>
+      </div>
+      <div class="table-wrap" id="model-table" hidden>
+        <table>
+          <thead><tr><th scope="col">模型</th><th scope="col">模型 ID</th><th scope="col">输入</th><th scope="col">输出</th><th scope="col">缓存读取</th><th scope="col">缓存写入</th></tr></thead>
+          <tbody id="model-rows"></tbody>
+        </table>
+      </div>
+      <p class="detail" id="model-empty" hidden></p>
+    </section>
+  </main>
+  <dialog id="key-editor" class="key-editor" aria-labelledby="key-editor-title">
+    <form id="key-form">
+      <h2 id="key-editor-title">创建密钥</h2>
+      <div class="field-grid">
+        <label class="field">名称<input id="key-name" maxlength="80" required></label>
+        <label class="field">到期时间（本机）<input id="key-expiry" type="datetime-local"></label>
+      </div>
+      <fieldset>
+        <legend>允许的模型</legend>
+        <label class="check"><input id="allow-all-models" type="checkbox" checked> 允许全部模型</label>
+        <div class="model-options" id="model-options" hidden></div>
+      </fieldset>
+      <fieldset>
+        <legend>用量与速率上限</legend>
+        <p class="description">留空表示不限。RPM 统计最近 60 秒放行的推理请求。token 和费用按上游响应结算。</p>
+        <div class="field-grid">
+          <label class="field">累计请求数<input id="key-limit-requests" type="number" min="1" step="1" placeholder="不限"></label>
+          <label class="field">RPM<input id="key-limit-rpm" type="number" min="1" step="1" placeholder="不限"></label>
+          <label class="field">Tokens<input id="key-limit-tokens" type="number" min="1" step="1" placeholder="不限"></label>
+          <label class="field">估算费用（USD）<input id="key-limit-cost" type="number" min="0.000000001" step="any" placeholder="不限"></label>
+        </div>
+      </fieldset>
+      <p class="detail form-error" id="key-error" role="alert" hidden></p>
+      <div class="actions">
+        <button class="button" id="cancel-key-edit" type="button">取消</button>
+        <button class="button primary" id="save-key" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="confirm-key-dialog" aria-labelledby="confirm-key-title">
+    <form method="dialog">
+      <h2 id="confirm-key-title">管理密钥</h2>
+      <p id="confirm-key-message"></p>
+      <div class="actions">
+        <button class="button" value="cancel" autofocus>取消</button>
+        <button class="button danger" id="confirm-key-button" value="confirm">确认</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>
