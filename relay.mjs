@@ -1,5 +1,6 @@
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { AppError, createSseParser, inferenceError, isResponsesStream, streamEvents } from './openai.mjs';
 import { usageDays } from './usage.mjs';
 import { estimateNanoDollars } from './pricing.mjs';
@@ -10,6 +11,11 @@ const unsupportedFields = [
   'temperature', 'top_logprobs', 'top_p', 'truncation', 'user', 'previous_response_id',
 ];
 const upstreamHeaderNames = ['x-request-id', 'retry-after'];
+const overloadCodes = new Set(['overloaded', 'overloaded_error', 'server_overloaded',
+  'server_is_overloaded', 'model_overloaded', 'engine_overloaded']);
+const preludeEvents = new Set(['response.queued', 'response.created', 'response.in_progress']);
+const maxOverloadRetries = 2;
+const maxPreludeBytes = 256 * 1024;
 
 class RelayError extends AppError {
   constructor(status, message, code, param = null) {
@@ -89,6 +95,26 @@ function upstreamHeaders(response) {
   return headers;
 }
 
+function isOverload(error, status) {
+  if (status === 401 || status === 403 || error?.code === 'subscription_sharing_usage_limit_exceeded') return false;
+  return overloadCodes.has(error?.code) || overloadCodes.has(error?.type) ||
+    (typeof error?.message === 'string' && /\boverloaded\b/i.test(error.message)) ||
+    (status === 503 && (!error?.code || ['server_error', 'service_unavailable'].includes(error.code)));
+}
+
+function retryDelay(attempt, retryAfter, deadline) {
+  if (attempt >= maxOverloadRetries) return null;
+  const now = Date.now();
+  let serverWait = 0;
+  if (retryAfter) {
+    serverWait = /^\d+$/.test(retryAfter)
+      ? Number(retryAfter) * 1000
+      : (Date.parse(retryAfter) || now) - now;
+  }
+  const wait = Math.max(500 * 2 ** attempt, serverWait);
+  return now + wait < deadline ? wait : null;
+}
+
 function providerError(error, status) {
   const code = typeof error?.code === 'string' ? error.code : null;
   const summary = inferenceError(code, status);
@@ -96,16 +122,27 @@ function providerError(error, status) {
     return new RelayError(401, 'The ChatGPT plan authorization was rejected. Reauthorize it in the local window.',
       code ?? 'chatgpt_reauthorization_required');
   }
-  return new RelayError(status || summary.status,
+  const overloaded = isOverload(error, status);
+  const failure = new RelayError(status || (overloaded ? 503 : summary.status),
     typeof error?.message === 'string' && error.message ? error.message : summary.message,
     code ?? 'upstream_error', typeof error?.param === 'string' ? error.param : null);
+  failure.overloaded = overloaded;
+  return failure;
+}
+
+function eventError(event) {
+  return event.response?.error ?? event.error ?? event;
+}
+
+function isFailureEvent(event) {
+  return event?.type === 'response.failed' || event?.type === 'error';
 }
 
 async function aggregate(body, observe) {
   for await (const event of streamEvents(body)) {
     observe(event);
-    if (event.type === 'response.failed' || event.type === 'error') {
-      throw providerError(event.response?.error ?? event, 0);
+    if (isFailureEvent(event)) {
+      throw providerError(eventError(event), 0);
     }
     if (event.type === 'response.completed' || event.type === 'response.incomplete') {
       if (event.response && typeof event.response.id === 'string') return event.response;
@@ -115,12 +152,52 @@ async function aggregate(body, observe) {
   throw new RelayError(502, 'OpenAI ended the stream without a final response.', 'incomplete_stream');
 }
 
+function isPreludeEvent(event) {
+  return preludeEvents.has(event?.type) ||
+    (event?.type === 'response.output_item.added' && event.item?.type === 'message' && event.item.content?.length === 0) ||
+    (event?.type === 'response.content_part.added' && event.part?.type === 'output_text' && event.part.text === '');
+}
+
+async function streamPrelude(body) {
+  const reader = body.getReader();
+  const parse = createSseParser();
+  const chunks = [];
+  let bytes = 0;
+  let failure = null;
+  try {
+    while (bytes < maxPreludeBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      bytes += value.byteLength;
+      try {
+        for (const event of parse(value)) {
+          if (isPreludeEvent(event)) continue;
+          if (isFailureEvent(event) && isOverload(eventError(event), 0)) failure = event;
+          return { chunks, failure };
+        }
+      } catch {
+        // Preserve unfamiliar frames and stop probing once delivery cannot be retried safely.
+        break;
+      }
+    }
+    return { chunks, failure };
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function* streamWithPrelude(body, chunks) {
+  yield* chunks;
+  yield* body;
+}
+
 function usageObserver(usage, accountId, keyId, recordMeter) {
   let recorded = false;
   let limited = false;
   const keyScope = 'key:' + keyId;
   return event => {
-    const code = event.response?.error?.code ?? event.code;
+    const code = eventError(event).code;
     if (!limited && code === 'subscription_sharing_usage_limit_exceeded') {
       limited = true;
       usage.noteLimit(accountId);
@@ -169,6 +246,8 @@ export function createRelay({ getKeys, pricing, getOpenAI, isSigningOut, usage, 
     let controller;
     let timeout;
     let keyId;
+    let keepalive;
+    let streamCommitted = false;
     const settlement = { tokens: null, estimatedNanoDollars: null, upstreamAccepted: false };
     async function settle() {
       if (!keyId) return;
@@ -203,7 +282,9 @@ export function createRelay({ getKeys, pricing, getOpenAI, isSigningOut, usage, 
       controller = new AbortController();
       active.add(controller);
       res.once('close', () => controller.abort());
-      timeout = AbortSignal.timeout(normalized ? 300000 : 25000);
+      const timeoutMs = normalized ? 300000 : 25000;
+      const deadline = Date.now() + timeoutMs;
+      timeout = AbortSignal.timeout(timeoutMs);
       const signal = AbortSignal.any([controller.signal, timeout]);
       if (!normalized) {
         const { models, cacheHit } = await openai.models();
@@ -218,43 +299,70 @@ export function createRelay({ getKeys, pricing, getOpenAI, isSigningOut, usage, 
       keys.permit(access, model);
       const { quotes } = await pricing.get();
       const quote = Object.hasOwn(quotes, model) ? quotes[model] : null;
-      const { response, accountId } = await openai.relayResponses(normalized.payload, signal, async () => {
-        keyId = await keys.reserve(access, model, quote);
-      });
-      settlement.upstreamAccepted = response.ok;
-      headers = upstreamHeaders(response);
-      if (!response.ok) {
-        if (response.status === 429) {
-          usage.noteLimit(accountId);
-          usage.noteLimit('key:' + keyId);
-        }
-        const body = await response.json().catch(() => ({}));
-        throw providerError(body?.error, response.status);
-      }
-      if (!isResponsesStream(response)) {
-        await response.body?.cancel().catch(() => {});
-        throw new RelayError(502, 'OpenAI returned an unexpected response format.', 'invalid_upstream_stream');
-      }
-      const observe = usageObserver(usage, accountId, keyId, report => {
-        settlement.tokens = tokensReported(report);
-        settlement.estimatedNanoDollars = estimateNanoDollars(quote, report);
-      });
-      if (!normalized.stream) {
-        const result = await aggregate(response.body, observe);
-        await settle();
-        return reply(res, 200, result, undefined, headers);
-      }
+      for (let attempt = 0; ; attempt++) {
+        const { response, accountId } = await openai.relayResponses(normalized.payload, signal, async () => {
+          if (keyId) keys.permit(access, model);
+          else keyId = await keys.reserve(access, model, quote);
+        });
+        settlement.upstreamAccepted ||= response.ok;
+        headers = upstreamHeaders(response);
+        try {
+          if (!response.ok) {
+            if (response.status === 429) {
+              usage.noteLimit(accountId);
+              usage.noteLimit('key:' + keyId);
+            }
+            const body = await response.json().catch(() => ({}));
+            throw providerError(body?.error ?? body, response.status);
+          }
+          if (!isResponsesStream(response)) {
+            await response.body?.cancel().catch(() => {});
+            throw new RelayError(502, 'OpenAI returned an unexpected response format.', 'invalid_upstream_stream');
+          }
+          const observe = usageObserver(usage, accountId, keyId, report => {
+            const tokens = tokensReported(report);
+            const price = estimateNanoDollars(quote, report);
+            if (tokens !== null) settlement.tokens = (settlement.tokens ?? 0) + tokens;
+            if (price !== null) settlement.estimatedNanoDollars = (settlement.estimatedNanoDollars ?? 0) + price;
+          });
+          if (!normalized.stream) {
+            const result = await aggregate(response.body, observe);
+            await settle();
+            return reply(res, 200, result, undefined, headers);
+          }
 
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-store',
-        'X-Content-Type-Options': 'nosniff',
-        ...headers,
-      });
-      res.flushHeaders();
-      await pipeline(Readable.fromWeb(response.body), inspectStream(observe), res, { signal, end: false });
-      await settle();
-      res.end();
+          if (!res.headersSent) {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream; charset=utf-8',
+              'Cache-Control': 'no-store',
+              'X-Content-Type-Options': 'nosniff',
+              ...headers,
+            });
+            res.flushHeaders();
+            keepalive = setInterval(() => {
+              if (!res.destroyed && !res.writableNeedDrain) res.write(': relay waiting\n\n');
+            }, 10000);
+          }
+
+          const { chunks, failure } = await streamPrelude(response.body);
+          if (failure && retryDelay(attempt, headers['retry-after'], deadline) !== null) {
+            observe(failure);
+            await response.body.cancel().catch(() => {});
+            throw providerError(eventError(failure), 0);
+          }
+          clearInterval(keepalive);
+          streamCommitted = true;
+          const source = Readable.from(streamWithPrelude(response.body, chunks), { objectMode: false });
+          await pipeline(source, inspectStream(observe), res, { signal, end: false });
+          await settle();
+          return res.end();
+        } catch (error) {
+          const wait = !streamCommitted && error.overloaded
+            ? retryDelay(attempt, headers['retry-after'], deadline) : null;
+          if (wait === null) throw error;
+          await delay(wait, undefined, { signal });
+        }
+      }
     } catch (error) {
       try {
         await settle();
@@ -262,16 +370,21 @@ export function createRelay({ getKeys, pricing, getOpenAI, isSigningOut, usage, 
         error = storageError;
       }
       if (res.destroyed) return;
-      if (res.headersSent) return res.destroy();
       const failure = timeout?.aborted
         ? new RelayError(504, 'The OpenAI request timed out.', 'upstream_timeout')
         : localError(error);
+      if (res.headersSent) {
+        if (streamCommitted) return res.destroy();
+        const { code, message, param } = responseError(failure).error;
+        return res.end('event: error\ndata: ' + JSON.stringify({ type: 'error', code, message, param }) + '\n\n');
+      }
       if (Number.isInteger(error.retryAfter) && failure.status === 429) {
         headers = { ...headers, 'Retry-After': String(error.retryAfter) };
       }
       if (failure.status === 413) headers = { ...headers, Connection: 'close' };
       reply(res, failure.status, responseError(failure), undefined, headers);
     } finally {
+      clearInterval(keepalive);
       active.delete(controller);
     }
   }

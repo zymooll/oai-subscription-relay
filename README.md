@@ -60,6 +60,7 @@ Invoke-RestMethod "$baseUrl/responses" -Method Post -Headers $headers -ContentTy
 | `GET /v1/usage?days=7` | 当前密钥的日用量及累计计数和上限。`days` 支持 1 到 30。此接口由中继提供。 |
 
 - **请求次数与 RPM**在转发前计算。RPM 达到上限时，返回 `429`、`relay_key_rpm_exceeded` 和以秒为单位的 `Retry-After`。
+- **上游过载重试**最多额外尝试两次，并遵循总请求超时内的 `Retry-After`。流式请求在正文或工具调用发出前可沿用同一连接重试，整次调用只占用一次中继请求数和 RPM。已发出正文或工具调用的流会继续透传上游结果。
 - **Token 与估算费用**使用上游响应报告的数据结算。设有这两类限额的密钥同一时间放行一个推理请求，单次响应可能使累计用量越过上限，结算后会拦截后续请求。
 - **估算费用**按 models.dev 公布的每百万 tokens 参考价计算，包含适用的缓存和长上下文档位。套餐余额与跨设备用量可在官方页面查看。 [ChatGPT 用量设置](https://chatgpt.com/settings/usage) · [参考价格目录](https://models.dev/api.json)
 
